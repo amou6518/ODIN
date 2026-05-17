@@ -393,7 +393,7 @@ Laptop ROS graph
 
 ## Jetson 분산 실행 가이드
 
-ODIN은 topic, namespace, package 단위로 분리되어 있어 Jetson 분산 실행으로 확장할 수 있습니다. 현재 Gazebo 기반 데모에서는 laptop/desktop이 시뮬레이션과 시각화를 담당하고, Jetson은 Qwen server 또는 일부 ROS node 그룹을 담당하는 방식부터 적용하는 것을 권장합니다.
+ODIN은 topic, namespace, package 단위로 분리되어 있어 Jetson 분산 실행으로 확장할 수 있습니다. 현재 Gazebo 기반 데모에서는 laptop/desktop이 시뮬레이션과 시각화를 담당하고, 풀 분산 구성에서는 scout, rescue, coordinator, Qwen/AI 역할을 Jetson 장비로 분리하는 것을 목표로 합니다.
 
 ### 네트워크 공통 설정
 
@@ -429,11 +429,12 @@ ros2 topic list
 
 | 장비 | 역할 | 주요 node/topic |
 | --- | --- | --- |
-| Laptop/Desktop | Gazebo, RViz, GUI, map merge, coordinator | `/merged_map`, `/coordinator/*`, GUI panels |
+| Laptop/Desktop | Gazebo, RViz, GUI, map merge | `/merged_map`, GUI panels |
 | Jetson 1 | `robot_1` scout stack | `/robot_1/scan`, `/robot_1/odom`, `/robot_1/map`, `/robot_1/cmd_vel` |
 | Jetson 2 | `robot_2` scout stack | `/robot_2/scan`, `/robot_2/odom`, `/robot_2/map`, `/robot_2/cmd_vel` |
 | Jetson 3 | `robot_3` rescue stack | `/robot_3/scan`, `/robot_3/odom`, `/robot_3/goal_pose`, `/robot_3/cmd_vel` |
-| Jetson 4 | Qwen server 또는 AI node | HTTP Qwen endpoint 또는 `/ai/*` |
+| Jetson 4 | Qwen server, AI planner | `/ai/*`, HTTP Qwen endpoint |
+| Jetson 5 | coordinator | `/coordinator/*`, `/robot_3/spawn_trigger`, `/robot_3/goal_pose` |
 
 ### 현재 데모 기준 실행 예시
 
@@ -466,14 +467,37 @@ ros2 launch odin_bringup sim_multi_slam_map_merge.launch.py
 
 ROS node를 실제 Jetson들에 나누는 경우에는 중복 실행을 피해야 합니다. 예를 들어 laptop에서 전체 launch를 그대로 실행하면서 Jetson에서도 같은 node를 실행하면 topic과 TF가 중복됩니다. 분산 실행 시에는 아래처럼 기능 그룹을 나누어 실행합니다.
 
-Laptop/Desktop, Gazebo와 중앙 기능:
+Laptop/Desktop, Gazebo와 시각화/map merge:
 
 ```bash
 ros2 launch odin_gazebo house_easier_three_robots.launch.py
 ros2 launch odin_map_merge scenario_scan_map_merge.launch.py
-ros2 launch odin_coordinator rescue_coordinator.launch.py \
-  battlefield_config_file:=/home/odin/robotics_ws/ros2_ws/install/odin_bringup/share/odin_bringup/config/battlefield_rules.yaml
+ros2 launch odin_detection rgb_aruco_event_detector.launch.py
+```
+
+Jetson 4, Qwen/AI:
+
+```bash
+cd ~/llama.cpp/build
+./bin/llama-server \
+  -m ~/Qwen3-VL-4B-Instruct-Q4_K_M.gguf \
+  --mmproj ~/Qwen3-VL-4B-Instruct-mmproj.gguf \
+  --host 0.0.0.0 \
+  --port 8081 \
+  --ctx-size 1024 \
+  --gpu-layers 0 \
+  --no-mmproj-offload \
+  --jinja \
+  --reasoning off
+
 ros2 launch odin_ai virtual_qwen_planner.launch.py \
+  battlefield_config_file:=/home/odin/robotics_ws/ros2_ws/install/odin_bringup/share/odin_bringup/config/battlefield_rules.yaml
+```
+
+Jetson 5, coordinator:
+
+```bash
+ros2 launch odin_coordinator rescue_coordinator.launch.py \
   battlefield_config_file:=/home/odin/robotics_ws/ros2_ws/install/odin_bringup/share/odin_bringup/config/battlefield_rules.yaml
 ```
 
@@ -729,11 +753,12 @@ docker compose --env-file .env down
 
 | 장비 | Compose file | 역할 |
 | --- | --- | --- |
-| Laptop/Desktop | `compose.desktop.yaml` | Gazebo, 중앙 기능, GUI |
+| Laptop/Desktop | `compose.desktop.yaml` | Gazebo, map merge, GUI |
 | Jetson 1 | `compose.robot_1.yaml` | `robot_1` scout stack |
 | Jetson 2 | `compose.robot_2.yaml` | `robot_2` scout stack |
 | Jetson 3 | `compose.robot_3.yaml` | `robot_3` rescue stack |
 | Jetson 4 | `compose.qwen.yaml` | Qwen server, AI planner |
+| Jetson 5 | `compose.coordinator.yaml` | coordinator |
 
 각 장비에서 공통으로 준비합니다.
 
@@ -754,10 +779,13 @@ QWEN_API_URL=http://<QWEN_JETSON_IP>:8081/v1/chat/completions
 실행 순서 예시:
 
 ```bash
-# Jetson 4
+# Jetson 4: Qwen/AI
 docker compose --env-file .env -f compose.qwen.yaml up --build
 
-# Laptop/Desktop
+# Jetson 5: coordinator
+docker compose --env-file .env -f compose.coordinator.yaml up --build
+
+# Laptop/Desktop: Gazebo + map merge + GUI
 xhost +local:docker
 docker compose --env-file .env -f compose.desktop.yaml up --build
 

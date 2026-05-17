@@ -1,0 +1,544 @@
+ODIN Jetson DHCP Deployment Guide
+=================================
+
+이 문서는 ODIN 데모를 DHCP 기반 유선 네트워크에서 실행하기 위한 최소 구성과 풀 분산 구성 절차를 정리한다.
+
+기본 전제
+---------
+
+- OS: Ubuntu 22.04 계열
+- ROS: ROS 2 Humble
+- Workspace: ~/robotics_ws/ros2_ws
+- Project: ~/robotics_ws/ros2_ws/src/odin_rescue
+- Laptop/Desktop Ethernet interface 예시: eno1
+- DHCP subnet 예시: 10.42.0.0/24
+- Laptop/Desktop DHCP server IP 예시: 10.42.0.1
+- Qwen Jetson IP 예시: 10.42.0.14
+- ROS_DOMAIN_ID 예시: 42
+
+주의:
+
+- 아래 IP와 interface 이름은 예시다. 실제 장비에서는 `ip link`와 `ip addr`로 interface 이름을 확인한다.
+- RMW를 CycloneDDS로 쓸 경우 모든 ROS 장비에 `ros-humble-rmw-cyclonedds-cpp`가 설치되어 있어야 한다.
+- Qwen server만 쓰는 Jetson은 ROS 2 node를 실행하지 않아도 된다. HTTP server만 열리면 된다.
+
+
+1. 공통 네트워크 세팅
+--------------------
+
+1-1. 물리 연결
+
+최소 구성:
+
+  Laptop/Desktop
+    |
+  Ethernet switch
+    |
+  Qwen Jetson
+
+풀 분산 구성:
+
+  Laptop/Desktop
+    |
+  Ethernet switch
+    |-- Jetson 1 robot_1 scout
+    |-- Jetson 2 robot_2 scout
+    |-- Jetson 3 robot_3 rescue
+    |-- Jetson 4 Qwen
+    |-- Jetson 5 coordinator
+
+
+1-2. Laptop/Desktop에 DHCP 서버용 IP 부여
+
+Laptop/Desktop에서:
+
+  ip link
+
+Ethernet interface가 `eno1`이라고 가정하면:
+
+  sudo ip addr flush dev eno1
+  sudo ip addr add 10.42.0.1/24 dev eno1
+  sudo ip link set eno1 up
+  ip addr show eno1
+
+
+1-3. DHCP 서버 실행
+
+일회성 DHCP server:
+
+  sudo dnsmasq \
+    --port=0 \
+    --interface=eno1 \
+    --bind-dynamic \
+    --dhcp-range=10.42.0.100,10.42.0.150,12h \
+    --dhcp-option=3,10.42.0.1 \
+    --log-dhcp \
+    --no-daemon
+
+다른 터미널에서 Jetson IP 확인:
+
+  arp -a
+  ip neigh
+
+또는 dnsmasq log에서 DHCP lease를 확인한다.
+
+
+1-4. Jetson 쪽 DHCP 연결
+
+Jetson에 직접 접속 가능할 때:
+
+  ip link
+  sudo dhclient <JETSON_ETH_INTERFACE>
+  ip addr show <JETSON_ETH_INTERFACE>
+
+NetworkManager를 쓰는 경우 예시:
+
+  nmcli device
+  sudo nmcli connection add type ethernet ifname <JETSON_ETH_INTERFACE> con-name odin-wired ipv4.method auto
+  sudo nmcli connection up odin-wired
+  ip addr
+
+Laptop/Desktop에서 ping 확인:
+
+  ping -c 3 <JETSON_IP>
+
+SSH 확인:
+
+  ssh <USER>@<JETSON_IP>
+
+
+2. ROS 2 공통 환경 변수
+-----------------------
+
+ROS node를 실행하는 모든 장비에서:
+
+  source /opt/ros/humble/setup.bash
+  source ~/robotics_ws/ros2_ws/install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+CycloneDDS 사용 시 모든 ROS 장비에서:
+
+  sudo apt install ros-humble-rmw-cyclonedds-cpp
+  export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+
+주의:
+
+- 어떤 장비에 `rmw_cyclonedds_cpp`가 설치되어 있지 않으면 해당 export 때문에 ROS가 실행되지 않는다.
+- 이 경우 모든 장비에 설치하거나, 모든 장비에서 RMW_IMPLEMENTATION export를 제거한다.
+
+ROS multicast 확인:
+
+터미널 A:
+
+  ros2 multicast receive
+
+터미널 B:
+
+  ros2 multicast send
+
+Topic discovery 확인:
+
+  ros2 topic list
+  ros2 node list
+
+
+3. 최소 구성: Qwen Jetson 1대 + Laptop/Desktop 1대
+-------------------------------------------------
+
+목표:
+
+- Laptop/Desktop: Gazebo, scout SLAM, map merge, coordinator, GUI, robot_3 Nav2 등 전체 ROS graph 실행
+- Qwen Jetson: llama.cpp Qwen server만 실행
+
+이 구성은 가장 안정적인 발표/데모 구성이다.
+
+
+3-1. Qwen Jetson에서 Qwen server 실행
+
+Qwen Jetson에서:
+
+  cd ~/llama.cpp/build
+
+  ./bin/llama-server \
+    -m ~/Qwen3-VL-4B-Instruct-Q4_K_M.gguf \
+    --mmproj ~/Qwen3-VL-4B-Instruct-mmproj.gguf \
+    --host 0.0.0.0 \
+    --port 8081 \
+    --ctx-size 1024 \
+    --gpu-layers 0 \
+    --no-mmproj-offload \
+    --jinja \
+    --reasoning off
+
+Laptop/Desktop에서 health check:
+
+  curl http://<QWEN_JETSON_IP>:8081/health
+
+예:
+
+  curl http://10.42.0.14:8081/health
+
+
+3-2. Qwen API URL 설정
+
+파일:
+
+  ~/robotics_ws/ros2_ws/src/odin_rescue/odin_ai/config/virtual_qwen_planner.yaml
+
+항목:
+
+  qwen_api_url: http://<QWEN_JETSON_IP>:8081/v1/chat/completions
+
+예:
+
+  qwen_api_url: http://10.42.0.14:8081/v1/chat/completions
+
+수정 후 build:
+
+  cd ~/robotics_ws/ros2_ws
+  colcon build --packages-select odin_ai odin_bringup
+  source install/setup.bash
+
+
+3-3. Laptop/Desktop에서 전체 시뮬레이션 실행
+
+  cd ~/robotics_ws/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+  ros2 launch odin_bringup sim_multi_slam_map_merge.launch.py
+
+분산 배치 뷰까지 같이 출력하려면:
+
+  ros2 launch odin_bringup sim_multi_slam_map_merge.launch.py start_deployment_view:=true
+
+
+3-4. 최소 구성 확인 명령
+
+  ros2 topic list | grep -E 'robot_1|robot_2|robot_3|merged_map|hostage|coordinator|ai|mission'
+  ros2 node list
+  ros2 topic echo /ai/status
+  ros2 topic echo /coordinator/status
+  ros2 topic echo /robot_3/dispatch_status
+
+분산 배치 뷰만 따로 실행:
+
+  ros2 run odin_bringup deployment_view
+
+
+4. 풀 분산 구성: 각 Jetson에 노드 그룹 분리
+---------------------------------------------
+
+목표 역할:
+
+- Laptop/Desktop: Gazebo, GUI, map merge, detection, optional monitoring
+- Jetson 1: robot_1 scout stack
+- Jetson 2: robot_2 scout stack
+- Jetson 3: robot_3 rescue stack
+- Jetson 4: Qwen server 또는 odin_ai node
+- Jetson 5: coordinator
+
+주의:
+
+- 풀 분산 구성에서는 같은 node를 두 장비에서 동시에 실행하지 않는다.
+- 예를 들어 Laptop/Desktop에서 `sim_multi_slam_map_merge.launch.py` 전체를 실행하면서 Jetson 1에서도 robot_1 SLAM을 실행하면 node/topic/TF가 중복된다.
+- 실제 로봇에서는 Gazebo가 제공하던 `/robot_i/scan`, `/robot_i/odom`, `/robot_i/cmd_vel` 연결을 실제 robot driver가 담당해야 한다.
+- 현재 Gazebo 데모에서는 laptop이 센서와 robot model을 시뮬레이션한다.
+
+
+4-1. Laptop/Desktop 시뮬레이션/시각화 기능 실행
+
+Gazebo:
+
+  cd ~/robotics_ws/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+  ros2 launch odin_gazebo house_easier_three_robots.launch.py
+
+Map merge:
+
+  ros2 launch odin_map_merge scenario_scan_map_merge.launch.py
+
+Detection:
+
+  ros2 launch odin_detection rgb_aruco_event_detector.launch.py
+
+Deployment view:
+
+  ros2 run odin_bringup deployment_view
+
+
+4-2. Jetson 1: robot_1 scout stack
+
+Jetson 1에서:
+
+  cd ~/robotics_ws/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+robot_1 SLAM:
+
+  ros2 run slam_toolbox async_slam_toolbox_node \
+    --ros-args \
+    -r __ns:=/robot_1 \
+    -p use_sim_time:=true \
+    -p scan_topic:=scan \
+    -p map_frame:=robot_1/map \
+    -p odom_frame:=robot_1/odom \
+    -p base_frame:=robot_1/base_footprint \
+    --params-file ~/robotics_ws/ros2_ws/install/odin_slam/share/odin_slam/config/slam_toolbox.yaml
+
+robot_1 scout navigation:
+
+  ros2 run odin_exploration reactive_scout \
+    --ros-args \
+    -r __ns:=/robot_1 \
+    -p use_sim_time:=true
+
+확인:
+
+  ros2 topic echo /robot_1/scan --once
+  ros2 topic echo /robot_1/odom --once
+  ros2 topic echo /robot_1/map --once --field info
+
+
+4-3. Jetson 2: robot_2 scout stack
+
+Jetson 2에서:
+
+  cd ~/robotics_ws/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+robot_2 SLAM:
+
+  ros2 run slam_toolbox async_slam_toolbox_node \
+    --ros-args \
+    -r __ns:=/robot_2 \
+    -p use_sim_time:=true \
+    -p scan_topic:=scan \
+    -p map_frame:=robot_2/map \
+    -p odom_frame:=robot_2/odom \
+    -p base_frame:=robot_2/base_footprint \
+    --params-file ~/robotics_ws/ros2_ws/install/odin_slam/share/odin_slam/config/slam_toolbox.yaml
+
+robot_2 scout navigation:
+
+  ros2 run odin_exploration reactive_scout \
+    --ros-args \
+    -r __ns:=/robot_2 \
+    -p use_sim_time:=true
+
+확인:
+
+  ros2 topic echo /robot_2/scan --once
+  ros2 topic echo /robot_2/odom --once
+  ros2 topic echo /robot_2/map --once --field info
+
+
+4-4. Jetson 3: robot_3 rescue stack
+
+Jetson 3에서:
+
+  cd ~/robotics_ws/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+robot_3 Nav2 dispatch:
+
+  ros2 launch odin_navigation robot_3_nav2_dispatch.launch.py
+
+확인:
+
+  ros2 topic echo /robot_3/goal_pose
+  ros2 topic echo /robot_3/dispatch_status
+  ros2 topic echo /robot_3/cmd_vel
+
+
+4-5. Jetson 4: Qwen server 또는 AI node
+
+Qwen server만 실행하는 경우:
+
+  cd ~/llama.cpp/build
+
+  ./bin/llama-server \
+    -m ~/Qwen3-VL-4B-Instruct-Q4_K_M.gguf \
+    --mmproj ~/Qwen3-VL-4B-Instruct-mmproj.gguf \
+    --host 0.0.0.0 \
+    --port 8081 \
+    --ctx-size 1024 \
+    --gpu-layers 0 \
+    --no-mmproj-offload \
+    --jinja \
+    --reasoning off
+
+AI ROS node까지 Jetson 4에서 실행하는 경우:
+
+  cd ~/robotics_ws/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+  ros2 launch odin_ai virtual_qwen_planner.launch.py \
+    battlefield_config_file:=~/robotics_ws/ros2_ws/install/odin_bringup/share/odin_bringup/config/battlefield_rules.yaml
+
+
+4-6. Jetson 5: coordinator
+
+Jetson 5에서:
+
+  cd ~/robotics_ws/ros2_ws
+  source /opt/ros/humble/setup.bash
+  source install/setup.bash
+
+  export ROS_DOMAIN_ID=42
+  export ROS_LOCALHOST_ONLY=0
+
+Coordinator:
+
+  ros2 launch odin_coordinator rescue_coordinator.launch.py \
+    battlefield_config_file:=~/robotics_ws/ros2_ws/install/odin_bringup/share/odin_bringup/config/battlefield_rules.yaml
+
+확인:
+
+  ros2 topic echo /coordinator/status
+  ros2 topic echo /coordinator/candidate_routes
+  ros2 topic echo /coordinator/validated_waypoint
+
+
+5. 전체 실행 순서 추천
+---------------------
+
+최소 구성:
+
+  1. Laptop/Desktop에서 DHCP server 실행
+  2. Qwen Jetson을 DHCP로 연결
+  3. Qwen Jetson에서 llama-server 실행
+  4. Laptop/Desktop에서 curl health check
+  5. Laptop/Desktop에서 ODIN 전체 launch 실행
+  6. Mission Intent GUI에서 FAST / SAFE / STEALTH intent 전송
+  7. Gazebo, Qwen route map, mission timeline, deployment view 캡처
+
+풀 분산 구성:
+
+  1. Laptop/Desktop에서 DHCP server 실행
+  2. Jetson 1~5 DHCP 연결 확인
+  3. 모든 ROS 장비에서 ROS_DOMAIN_ID / ROS_LOCALHOST_ONLY 설정
+  4. Jetson 4에서 Qwen server와 AI node 실행
+  5. Jetson 5에서 coordinator 실행
+  6. Laptop/Desktop에서 Gazebo, map merge, detection, GUI 실행
+  7. Jetson 1에서 robot_1 SLAM/exploration 실행
+  8. Jetson 2에서 robot_2 SLAM/exploration 실행
+  9. Jetson 3에서 robot_3 Nav2 dispatch 실행
+  10. topic list, node list, deployment_view로 graph 확인
+
+
+6. 자주 쓰는 확인 명령
+---------------------
+
+Node 확인:
+
+  ros2 node list
+
+Topic 확인:
+
+  ros2 topic list | grep -E 'robot_1|robot_2|robot_3|merged_map|hostage|coordinator|ai|mission'
+
+TF 확인:
+
+  ros2 run tf2_tools view_frames
+
+Map 확인:
+
+  ros2 topic echo /merged_map --once --field info
+
+Mission policy 확인:
+
+  ros2 topic echo /ai/mission_policy
+
+Qwen 선택 경로 확인:
+
+  ros2 topic echo /ai/selected_path --once
+
+Robot 3 상태 확인:
+
+  ros2 topic echo /robot_3/dispatch_status
+
+Deployment view:
+
+  ros2 run odin_bringup deployment_view
+
+
+7. 문제 해결
+------------
+
+문제: `rmw_cyclonedds_cpp` 관련 오류가 난다.
+
+해결:
+
+  sudo apt install ros-humble-rmw-cyclonedds-cpp
+
+또는:
+
+  unset RMW_IMPLEMENTATION
+
+
+문제: 다른 장비 topic이 안 보인다.
+
+확인:
+
+  echo $ROS_DOMAIN_ID
+  echo $ROS_LOCALHOST_ONLY
+  ip addr
+  ping <OTHER_DEVICE_IP>
+  ros2 multicast send
+  ros2 multicast receive
+
+
+문제: Qwen 응답이 없다.
+
+확인:
+
+  curl http://<QWEN_JETSON_IP>:8081/health
+  ros2 topic echo /ai/status
+
+`odin_ai/config/virtual_qwen_planner.yaml`의 `qwen_api_url`이 실제 Jetson IP와 일치하는지 확인한다.
+
+
+문제: node가 중복되어 이상하게 동작한다.
+
+해결:
+
+- 전체 launch와 개별 Jetson launch를 동시에 중복 실행하지 않는다.
+- 분산 실행에서는 기능 그룹별 launch만 실행한다.
+- `ros2 node list`로 중복 node를 확인한다.
+
+
+문제: robot_3가 goal을 받지 않는다.
+
+확인:
+
+  ros2 topic echo /robot_3/goal_pose
+  ros2 topic echo /ai/waypoint_recommendation
+  ros2 topic echo /coordinator/status
+  ros2 topic echo /robot_3/dispatch_status

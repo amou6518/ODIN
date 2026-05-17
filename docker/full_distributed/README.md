@@ -4,11 +4,12 @@
 
 권장 역할:
 
-- Laptop/Desktop: Gazebo, map merge, coordinator, detection, GUI
+- Laptop/Desktop: Gazebo, map merge, detection, GUI
 - Jetson 1: `robot_1` scout stack
 - Jetson 2: `robot_2` scout stack
 - Jetson 3: `robot_3` rescue/Nav2 stack
 - Jetson 4: Qwen server + `virtual_qwen_planner`
+- Jetson 5: coordinator
 
 모든 장비는 같은 유선망, 같은 `ROS_DOMAIN_ID`, `ROS_LOCALHOST_ONLY=0`을 사용합니다.
 
@@ -64,6 +65,12 @@ Jetson 4:
 docker compose --env-file .env -f compose.qwen.yaml build
 ```
 
+Jetson 5:
+
+```bash
+docker compose --env-file .env -f compose.coordinator.yaml build
+```
+
 ## 실행 순서
 
 1. Jetson 4에서 Qwen server와 AI planner 실행
@@ -72,26 +79,32 @@ docker compose --env-file .env -f compose.qwen.yaml build
 docker compose --env-file .env -f compose.qwen.yaml up
 ```
 
-2. Laptop/Desktop에서 Gazebo와 중앙 기능 실행
+2. Jetson 5에서 coordinator 실행
+
+```bash
+docker compose --env-file .env -f compose.coordinator.yaml up
+```
+
+3. Laptop/Desktop에서 Gazebo, map merge, detection, GUI 실행
 
 ```bash
 xhost +local:docker
 docker compose --env-file .env -f compose.desktop.yaml up
 ```
 
-3. Jetson 1에서 robot_1 stack 실행
+4. Jetson 1에서 robot_1 stack 실행
 
 ```bash
 docker compose --env-file .env -f compose.robot_1.yaml up
 ```
 
-4. Jetson 2에서 robot_2 stack 실행
+5. Jetson 2에서 robot_2 stack 실행
 
 ```bash
 docker compose --env-file .env -f compose.robot_2.yaml up
 ```
 
-5. Jetson 3에서 robot_3 stack 실행
+6. Jetson 3에서 robot_3 stack 실행
 
 ```bash
 docker compose --env-file .env -f compose.robot_3.yaml up

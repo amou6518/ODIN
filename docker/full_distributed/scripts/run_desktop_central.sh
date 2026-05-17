@@ -6,7 +6,6 @@ BATTLEFIELD_CONFIG="/workspace/install/odin_bringup/share/odin_bringup/config/ba
 ros2 launch odin_gazebo house_easier_three_robots.launch.py gui:="${GAZEBO_GUI:-true}" &
 ros2 launch odin_map_merge scenario_scan_map_merge.launch.py &
 ros2 launch odin_detection rgb_aruco_event_detector.launch.py &
-ros2 launch odin_coordinator rescue_coordinator.launch.py battlefield_config_file:="${BATTLEFIELD_CONFIG}" &
 
 if [[ "${START_MISSION_INTENT_GUI:-true}" == "true" ]]; then
   ros2 run odin_ai mission_intent_panel --ros-args -p use_sim_time:=true &
